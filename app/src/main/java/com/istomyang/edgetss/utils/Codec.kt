@@ -190,7 +190,7 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
 
 
         suspend fun register(extractor: MediaExtractor, loadSize: Int, errCount: Int = 0) {
-            while (buffer0.position() < loadSize) {
+            while (buffer0.position() < loadSize && !dataOfEnd) {
                 delay(100)
             }
             try {

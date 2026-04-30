@@ -10,17 +10,19 @@ import com.istomyang.edgetss.data.LogRepository
 import com.istomyang.edgetss.data.SpeakerRepository
 import com.istomyang.edgetss.data.repositoryLog
 import com.istomyang.edgetss.data.repositorySpeaker
-import com.istomyang.edgetss.utils.Player
+import com.istomyang.edgetss.utils.Codec
 import com.istomyang.tts_engine.TTS
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.transform
+import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class EdgeTTSService : TextToSpeechService() {
     companion object {
@@ -30,7 +32,6 @@ class EdgeTTSService : TextToSpeechService() {
     private val scope = CoroutineScope(Dispatchers.IO)
 
     private lateinit var engine: TTS
-    private lateinit var player: Player
     private lateinit var logRepository: LogRepository
     private lateinit var speakerRepository: SpeakerRepository
 
@@ -40,6 +41,10 @@ class EdgeTTSService : TextToSpeechService() {
     private var outputFormat: String? = null
     private var sampleRate = 24000
 
+    private val synthesisMutex = Mutex()
+    @Volatile
+    private var activeSynthesis: SynthesisState? = null
+
     override fun onCreate() {
         super.onCreate()
 
@@ -48,18 +53,14 @@ class EdgeTTSService : TextToSpeechService() {
         speakerRepository = context.repositorySpeaker
 
         engine = TTS()
-        player = Player()
 
         scope.launch {
             launch { collectConfig() }
-
-            launch { collectAudioFromEngine() }
 
             try {
                 engine.run()
             } catch (_: CancellationException) {
             } catch (e: Throwable) {
-                resultChannel.send(Result.failure(e)) // tell error occurs.
                 error("engine run error: $e")
             }
         }
@@ -74,7 +75,7 @@ class EdgeTTSService : TextToSpeechService() {
     }
 
     override fun onStop() {
-        player.pause()
+        activeSynthesis?.stop()
     }
 
     private suspend fun collectConfig() {
@@ -101,27 +102,9 @@ class EdgeTTSService : TextToSpeechService() {
         return arrayOf("", "", "")
     }
 
-    private val resultChannel = Channel<Result<Unit>>()
-
-    private fun collectAudioFromEngine() = scope.launch {
-        engine.output().transform { frame ->
-            if (frame.audioCompleted) {
-                emit(Player.Frame(null, endOfFrame = true))
-                return@transform
-            }
-            if (frame.textCompleted) {
-                return@transform
-            }
-            emit(Player.Frame(frame.data))
-        }.play {
-            resultChannel.send(Result.success(Unit))
-        }
-    }
-
-    private suspend fun Flow<Player.Frame>.play(onCompleted: suspend () -> Unit) = player.run(this, onCompleted)
-
     override fun onSynthesizeText(request: SynthesisRequest?, callback: SynthesisCallback?) {
         if (request == null || callback == null || !prepared) {
+            callback?.error()
             return
         }
 
@@ -132,41 +115,95 @@ class EdgeTTSService : TextToSpeechService() {
         info("start synthesizing text: $text")
 
         runBlocking {
-            callback.start(sampleRate, AudioFormat.ENCODING_PCM_16BIT, 1)
-
-            player.play()
-
-            // 1. input text
-            val metadata = TTS.AudioMetaData(
-                locale = locale!!,
-                voiceName = voiceName!!,
-                volume = "+0%",
-                outputFormat = outputFormat!!,
-                pitch = "${pitch}Hz",
-                rate = "${rate}%",
-            )
-            try {
-                engine.input(text, metadata)
-            } catch (e: Throwable) {
-                callback.error()
-                error("synthesize text error: $e")
-                return@runBlocking
-            }
-
-            // 2. wait result
-            for (result in resultChannel) {
-                when {
-                    result.isSuccess -> {
-                        callback.done()
-                        break
-                    }
-
-                    result.isFailure -> {
-                        callback.error()
-                        break
+            synthesisMutex.withLock {
+                val synthesis = SynthesisState()
+                activeSynthesis = synthesis
+                try {
+                    synthesizeToCallback(text, pitch, rate, callback, synthesis)
+                } finally {
+                    if (activeSynthesis === synthesis) {
+                        activeSynthesis = null
                     }
                 }
             }
+        }
+    }
+
+    private suspend fun synthesizeToCallback(
+        text: String,
+        pitch: Int,
+        rate: Int,
+        callback: SynthesisCallback,
+        synthesis: SynthesisState
+    ) {
+        val metadata = TTS.AudioMetaData(
+            locale = locale!!,
+            voiceName = voiceName!!,
+            volume = "+0%",
+            outputFormat = outputFormat!!,
+            pitch = "${pitch}Hz",
+            rate = "${rate}%",
+        )
+
+        val compressedAudio = Channel<Codec.Frame>(8)
+        val decoder = scope.async {
+            Codec(compressedAudio.consumeAsFlow(), applicationContext).run(coroutineContext).collect { frame ->
+                if (!frame.endOfFrame && !synthesis.stopped) {
+                    sendAudio(callback, frame.data!!, synthesis)
+                }
+            }
+        }
+
+        try {
+            callback.start(sampleRate, AudioFormat.ENCODING_PCM_16BIT, 1)
+            engine.input(text, metadata)
+
+            while (true) {
+                val frame = engine.receiveOutput()
+                when {
+                    frame.textCompleted -> break
+                    frame.audioCompleted -> compressedAudio.send(Codec.Frame(null, endOfFrame = true))
+                    frame.data != null -> compressedAudio.send(Codec.Frame(frame.data))
+                }
+            }
+
+            compressedAudio.close()
+            decoder.await()
+
+            if (synthesis.stopped) {
+                callback.error()
+            } else {
+                callback.done()
+            }
+        } catch (e: Throwable) {
+            compressedAudio.close(e)
+            decoder.cancel()
+            callback.error()
+            error("synthesize text error: $e")
+        }
+    }
+
+    private fun sendAudio(callback: SynthesisCallback, data: ByteArray, synthesis: SynthesisState) {
+        var offset = 0
+        val maxBufferSize = maxOf(1, callback.maxBufferSize)
+        while (offset < data.size && !synthesis.stopped) {
+            val length = minOf(maxBufferSize, data.size - offset)
+            val status = callback.audioAvailable(data, offset, length)
+            if (status != TextToSpeech.SUCCESS) {
+                synthesis.stop()
+                return
+            }
+            offset += length
+        }
+    }
+
+    private class SynthesisState {
+        @Volatile
+        var stopped: Boolean = false
+            private set
+
+        fun stop() {
+            stopped = true
         }
     }
 

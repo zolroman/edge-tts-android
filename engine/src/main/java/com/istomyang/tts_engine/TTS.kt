@@ -29,16 +29,11 @@ import java.util.Locale
 
 class TTS {
     private val resultChannel = Channel<AudioFrame>(8)
-    private val chunkChannel = Channel<String?>(8)
+    private val chunkChannel = Channel<InputChunk>(8)
 
     // Can reuse ws connection.
     private var client: HttpClient? = null
     private var session: DefaultClientWebSocketSession? = null
-
-    /**
-     * At first, I used Frame to save metadata and data, then I discovered that input must wait previous output done.
-     */
-    private var currentMetadata: AudioMetaData? = null
 
     private var errCount = 0
 
@@ -55,12 +50,12 @@ class TTS {
             }
 
             for (chunk in chunkChannel) {
-                if (chunk == null) {
+                if (chunk.text == null) {
                     resultChannel.send(AudioFrame(null, textCompleted = true))
                     continue
                 }
-                val md = currentMetadata!!
-                val ssml = buildSSML(chunk, metadata = md)
+                val md = chunk.metadata
+                val ssml = buildSSML(chunk.text, metadata = md)
                 val speech = buildSpeechConfig(md.outputFormat)
                 communicate(speech, ssml) {
                     if (it == null) {
@@ -79,6 +74,7 @@ class TTS {
                 run()
                 return
             }
+            resultChannel.close(e)
             throw e
         }
     }
@@ -95,13 +91,11 @@ class TTS {
         if (text.invalid()) {
             throw Exception("Text is invalid.")
         }
-        currentMetadata = metadata
-
         val chunkSize = estimateTextLength(metadata)
         for (chunk in text.removeEmojis().trim().escapeXml().intoChunks(chunkSize)) {
-            chunkChannel.send(chunk)
+            chunkChannel.send(InputChunk(chunk, metadata))
         }
-        chunkChannel.send(null)
+        chunkChannel.send(InputChunk(null, metadata))
     }
 
     /**
@@ -111,6 +105,8 @@ class TTS {
      * Null represents the end of the audio file.
      */
     fun output(): Flow<AudioFrame> = resultChannel.consumeAsFlow()
+
+    suspend fun receiveOutput(): AudioFrame = resultChannel.receive()
 
     private suspend fun resolveHttp403() {
         val builder = makeHttpRequestBuilder(HttpRequestBuilder(), useWs = false)
@@ -237,6 +233,11 @@ class TTS {
         val data: ByteArray?,
         val textCompleted: Boolean = false,
         val audioCompleted: Boolean = false
+    )
+
+    private data class InputChunk(
+        val text: String?,
+        val metadata: AudioMetaData
     )
 
     data class AudioMetaData(

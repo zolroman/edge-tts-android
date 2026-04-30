@@ -13,6 +13,7 @@ import kotlinx.coroutines.channels.Channel.Factory.UNLIMITED
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.consumeAsFlow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
@@ -28,6 +29,114 @@ private fun debug(msg: String) {
 class Codec(private val source: Flow<Frame>, private val context: Context) {
 
     class Frame(val data: ByteArray?, val endOfFrame: Boolean = false)
+
+    companion object {
+        fun decode(data: ByteArray): Flow<ByteArray> {
+            return decodeSource(ByteArrayAudioDataSource(data))
+        }
+
+        private fun decodeSource(dataSource: MediaDataSource): Flow<ByteArray> = flow {
+            val extractor = MediaExtractor()
+            try {
+                extractor.setDataSource(dataSource)
+                emitAll(decodeExtractor(extractor) { true })
+            } finally {
+                extractor.release()
+                dataSource.close()
+            }
+        }
+
+        private fun decodeExtractor(extractor: MediaExtractor, inputComplete: () -> Boolean): Flow<ByteArray> = flow {
+
+            val trackIndex = getAudioTrackIndex(extractor)
+            val format = extractor.getTrackFormat(trackIndex)
+            val mimeType = format.getString(MediaFormat.KEY_MIME)
+
+            extractor.selectTrack(trackIndex)
+            val codec = MediaCodec.createDecoderByType(mimeType!!)
+            codec.configure(format, null, null, 0)
+            codec.start()
+
+            var inputEnded = false
+            var outputEnded = false
+
+            try {
+                while (!outputEnded) {
+                    if (!inputEnded) {
+                        val inputIndex = codec.dequeueInputBuffer(100_000)
+                        if (inputIndex >= 0) {
+                            val buffer = codec.getInputBuffer(inputIndex)
+                            when (val sampleSize = extractor.readSampleData(buffer!!, 0)) {
+                                -1 -> {
+                                    if (inputComplete()) {
+                                        codec.queueInputBuffer(
+                                            inputIndex,
+                                            0,
+                                            0,
+                                            0,
+                                            MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                        )
+                                        inputEnded = true
+                                    }
+                                }
+                                else -> {
+                                    codec.queueInputBuffer(inputIndex, 0, sampleSize, extractor.sampleTime, 0)
+                                    extractor.advance()
+                                }
+                            }
+                        }
+                    }
+
+                    val info = MediaCodec.BufferInfo()
+                    val outputIndex = codec.dequeueOutputBuffer(info, 200_000)
+                    if (outputIndex >= 0) {
+                        if (info.size > 0) {
+                            val output = codec.getOutputBuffer(outputIndex)
+                            if (output != null) {
+                                output.position(info.offset)
+                                output.limit(info.offset + info.size)
+                                val dest = ByteArray(info.size)
+                                output.get(dest)
+                                emit(dest)
+                            }
+                        }
+
+                        outputEnded = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                        codec.releaseOutputBuffer(outputIndex, false)
+                    }
+                }
+            } finally {
+                codec.stop()
+                codec.release()
+            }
+        }
+
+        private fun getAudioTrackIndex(extractor: MediaExtractor): Int {
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME)
+                if (mime!!.startsWith("audio/")) {
+                    return i
+                }
+            }
+            throw IllegalArgumentException("No audio track found.")
+        }
+
+        private class ByteArrayAudioDataSource(private val data: ByteArray) : MediaDataSource() {
+            override fun close() {}
+
+            override fun readAt(position: Long, buffer: ByteArray?, offset: Int, size: Int): Int {
+                if (position < 0 || position >= data.size) {
+                    return -1
+                }
+                val read = minOf(size, data.size - position.toInt())
+                System.arraycopy(data, position.toInt(), buffer!!, offset, read)
+                return read
+            }
+
+            override fun getSize(): Long = data.size.toLong()
+        }
+    }
 
     fun run(context: CoroutineContext): Flow<Frame> = flow {
         val dataChannel = Channel<Flow<ByteArray>>()
@@ -66,7 +175,7 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
             try {
                 for (src in dataChannel) {
                     // src drain when frame is eof.
-                    decode(src).onCompletion {
+                    decodeStream(src).onCompletion {
                         resultChannel.send(null)
                     }.collect {
                         mut.withLock {
@@ -104,74 +213,19 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
         }
     }
 
-    private fun decode(source: Flow<ByteArray>): Flow<ByteArray> = flow {
-        val extractor = MediaExtractor()
-
+    private fun decodeStream(source: Flow<ByteArray>): Flow<ByteArray> = flow {
         var endOfSource = false
-        AudioDataSource(source.onCompletion {
+        val dataSource = AudioDataSource(source.onCompletion {
             endOfSource = true
-        }).register(extractor, 1024)
-
-        val trackIndex = getAudioTrackIndex(extractor)
-        val format = extractor.getTrackFormat(trackIndex)
-        val mimeType = format.getString(MediaFormat.KEY_MIME)
-
-        extractor.selectTrack(trackIndex)
-        val codec = MediaCodec.createDecoderByType(mimeType!!)
-        codec.configure(format, null, null, 0)
-        codec.start()
-
-        while (true) {
-            val inputIndex = codec.dequeueInputBuffer(100_000) // wait 100ms is enough.
-            if (inputIndex >= 0) {
-                val buffer = codec.getInputBuffer(inputIndex)
-                when (val sampleSize = extractor.readSampleData(buffer!!, 0)) {
-                    -1 -> {
-                        if (endOfSource) {
-                            codec.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        } else {
-                            codec.queueInputBuffer(inputIndex, 0, 0, 0, 0)
-                        }
-                    }
-                    else -> {
-                        codec.queueInputBuffer(inputIndex, 0, sampleSize, extractor.sampleTime, 0)
-                        extractor.advance()
-                    }
-                }
-            }
-
-            val info = MediaCodec.BufferInfo()
-            val outputIndex = codec.dequeueOutputBuffer(info, 200_000)
-            if (outputIndex >= 0) {
-                val output = codec.getOutputBuffer(outputIndex)
-                if (output != null) {
-                    val dest = ByteArray(info.size)
-                    output.get(dest)
-                    emit(dest)
-                }
-                codec.releaseOutputBuffer(outputIndex, false)
-            } else if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                // wait 200ms is enough for codec to decode any pending data.
-                if (endOfSource) {
-                    break
-                }
-            }
+        })
+        val extractor = MediaExtractor()
+        try {
+            dataSource.register(extractor, 1024)
+            emitAll(decodeExtractor(extractor) { endOfSource })
+        } finally {
+            extractor.release()
+            dataSource.close()
         }
-
-        codec.stop()
-        codec.release()
-        extractor.release()
-    }
-
-    private fun getAudioTrackIndex(extractor: MediaExtractor): Int {
-        for (i in 0 until extractor.trackCount) {
-            val format = extractor.getTrackFormat(i)
-            val mime = format.getString(MediaFormat.KEY_MIME)
-            if (mime!!.startsWith("audio/")) {
-                return i
-            }
-        }
-        throw IllegalArgumentException("No audio track found.")
     }
 
     private class AudioDataSource(private val data: Flow<ByteArray>) : MediaDataSource() {

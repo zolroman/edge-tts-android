@@ -15,14 +15,12 @@ import com.istomyang.tts_engine.TTS
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.ByteArrayOutputStream
 
 class EdgeTTSService : TextToSpeechService() {
     companion object {
@@ -145,14 +143,7 @@ class EdgeTTSService : TextToSpeechService() {
             rate = "${rate}%",
         )
 
-        val compressedAudio = Channel<Codec.Frame>(8)
-        val decoder = scope.async {
-            Codec(compressedAudio.consumeAsFlow(), applicationContext).run(coroutineContext).collect { frame ->
-                if (!frame.endOfFrame && !synthesis.stopped) {
-                    sendAudio(callback, frame.data!!, synthesis)
-                }
-            }
-        }
+        val compressedAudio = ByteArrayOutputStream()
 
         try {
             callback.start(sampleRate, AudioFormat.ENCODING_PCM_16BIT, 1)
@@ -161,14 +152,21 @@ class EdgeTTSService : TextToSpeechService() {
             while (true) {
                 val frame = engine.receiveOutput()
                 when {
-                    frame.textCompleted -> break
-                    frame.audioCompleted -> compressedAudio.send(Codec.Frame(null, endOfFrame = true))
-                    frame.data != null -> compressedAudio.send(Codec.Frame(frame.data))
+                    frame.textCompleted -> {
+                        if (compressedAudio.size() > 0 && !synthesis.stopped) {
+                            decodeAndSendAudio(compressedAudio.toByteArray(), callback, synthesis)
+                        }
+                        break
+                    }
+                    frame.audioCompleted -> {
+                        if (compressedAudio.size() > 0 && !synthesis.stopped) {
+                            decodeAndSendAudio(compressedAudio.toByteArray(), callback, synthesis)
+                        }
+                        compressedAudio.reset()
+                    }
+                    frame.data != null -> compressedAudio.write(frame.data)
                 }
             }
-
-            compressedAudio.close()
-            decoder.await()
 
             if (synthesis.stopped) {
                 callback.error()
@@ -176,10 +174,20 @@ class EdgeTTSService : TextToSpeechService() {
                 callback.done()
             }
         } catch (e: Throwable) {
-            compressedAudio.close(e)
-            decoder.cancel()
             callback.error()
             error("synthesize text error: $e")
+        }
+    }
+
+    private suspend fun decodeAndSendAudio(
+        compressedAudio: ByteArray,
+        callback: SynthesisCallback,
+        synthesis: SynthesisState
+    ) {
+        Codec.decode(compressedAudio).collect { pcm ->
+            if (!synthesis.stopped) {
+                sendAudio(callback, pcm, synthesis)
+            }
         }
     }
 

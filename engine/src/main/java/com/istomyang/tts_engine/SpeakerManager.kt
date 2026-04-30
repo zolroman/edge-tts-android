@@ -15,25 +15,21 @@ class SpeakerManager {
         val client = HttpClient(CIO) {}
 
         val res = client.get(urlString = buildUrl()) {
-            header("sec-ch-ua-platform", "macOS")
-            header(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-            )
+            header("sec-ch-ua-platform", "Windows")
+            header("User-Agent", EdgeProtocol.USER_AGENT)
             header(
                 "sec-ch-ua",
-                "\"Microsoft Edge\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\""
+                "\" Not;A Brand\";v=\"99\", \"Microsoft Edge\";v=\"${EdgeProtocol.CHROMIUM_MAJOR_VERSION}\", \"Chromium\";v=\"${EdgeProtocol.CHROMIUM_MAJOR_VERSION}\""
             )
             header("sec-ch-ua-mobile", "?0")
             header("Accept", "*/*")
-            header("X-Edge-Shopping-Flag", "1")
             header("Sec-MS-GEC", DRM.genSecMsGec())
-            header("Sec-MS-GEC-Version", "1-131.0.2903.70")
+            header("Sec-MS-GEC-Version", EdgeProtocol.SEC_MS_GEC_VERSION)
             header("Sec-Fetch-Site", "none")
             header("Sec-Fetch-Mode", "cors")
             header("Sec-Fetch-Dest", "empty")
-            header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
-            header("Accept-Encoding", "gzip, deflate, br, zstd")
+            header("Accept-Language", EdgeProtocol.ACCEPT_LANGUAGE)
+            header("Accept-Encoding", EdgeProtocol.ACCEPT_ENCODING)
         }
 
         if (!res.status.isSuccess()) {
@@ -47,7 +43,7 @@ class SpeakerManager {
     }
 
     private fun buildUrl(): String {
-        return "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&Sec-MS-GEC=${DRM.genSecMsGec()}&Sec-MS-GEC-Version=1-131.0.2903.70"
+        return "https://${EdgeProtocol.BASE_URL}/voices/list?trustedclienttoken=${EdgeProtocol.TRUSTED_CLIENT_TOKEN}&Sec-MS-GEC=${DRM.genSecMsGec()}&Sec-MS-GEC-Version=${EdgeProtocol.SEC_MS_GEC_VERSION}"
     }
 
 //    {

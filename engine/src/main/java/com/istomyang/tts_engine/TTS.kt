@@ -126,13 +126,13 @@ class TTS {
             url(buildUrl(useWs))
             header("Pragma", "no-cache")
             header("Cache-Control", "no-cache")
-            header(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-            )
-            header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
-            header("Accept-Encoding", "gzip, deflate, br")
-            header("Accept-Language", "en-US,en;q=0.9")
+            header("User-Agent", EdgeProtocol.USER_AGENT)
+            header("Origin", EdgeProtocol.ORIGIN)
+            header("Accept-Encoding", EdgeProtocol.ACCEPT_ENCODING)
+            header("Accept-Language", EdgeProtocol.ACCEPT_LANGUAGE)
+            if (useWs) {
+                header("Cookie", "muid=${DRM.genMuid()};")
+            }
         }
     }
 
@@ -188,9 +188,10 @@ class TTS {
 
     private fun buildUrl(useWs: Boolean): String {
         return String.format(
-            "%s://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&Sec-MS-GEC=%s&Sec-MS-GEC-Version=1-131.0.2903.51&ConnectionId=%s",
+            "%s://${EdgeProtocol.BASE_URL}/edge/v1?TrustedClientToken=${EdgeProtocol.TRUSTED_CLIENT_TOKEN}&Sec-MS-GEC=%s&Sec-MS-GEC-Version=%s&ConnectionId=%s",
             if (useWs) "wss" else "https",
             DRM.genSecMsGec(),
+            EdgeProtocol.SEC_MS_GEC_VERSION,
             newUUID()
         )
     }

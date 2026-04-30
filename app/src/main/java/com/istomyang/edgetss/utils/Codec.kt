@@ -185,7 +185,8 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
                     }
 
                     mut.withLock {
-                        debug("receive pkg: $pkgReceiveCount a: ${pkgReceiveCount / pkgSendCount}")
+                        val ratio = if (pkgSendCount == 0) 0 else pkgReceiveCount / pkgSendCount
+                        debug("receive pkg: $pkgReceiveCount a: $ratio")
                         pkgReceiveCount = 0
                         pkgSendCount = 0
                     }
@@ -230,6 +231,7 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
 
     private class AudioDataSource(private val data: Flow<ByteArray>) : MediaDataSource() {
         private var buffer0 = ByteBuffer2()
+        @Volatile
         private var dataOfEnd = false
 
         init {
@@ -261,11 +263,14 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
         override fun close() {}
 
         override fun readAt(position: Long, buffer: ByteArray?, offset: Int, size: Int): Int {
-            if (position < 0 || (dataOfEnd && position >= buffer0.position())) {
+            if (position < 0) {
                 return -1
             }
             val read = buffer0.copyTo(position, buffer!!, offset, size)
-            return read
+            if (read > 0) {
+                return read
+            }
+            return if (dataOfEnd && position >= buffer0.position()) -1 else 0
         }
 
         override fun getSize(): Long = -1
@@ -290,6 +295,7 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
         private var cap = 1024 * 10 // 10KB
         private var buffer = ByteBuffer.allocate(cap)
 
+        @Synchronized
         fun put(b: ByteArray) {
             // check grow
             val need = buffer.position() + b.size
@@ -299,14 +305,16 @@ class Codec(private val source: Flow<Frame>, private val context: Context) {
             buffer.put(b)
         }
 
+        @Synchronized
         fun position() = buffer.position()
 
+        @Synchronized
         fun copyTo(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
             if (position > position()) {
                 return 0
             }
             val start = position.toInt()
-            val read = minOf(size - offset, position() - start)
+            val read = minOf(size, position() - start)
             val arr = this.buffer.array()
             System.arraycopy(arr, start, buffer, offset, read)
             return read

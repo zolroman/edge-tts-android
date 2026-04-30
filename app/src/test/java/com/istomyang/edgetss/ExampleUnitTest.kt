@@ -110,27 +110,4 @@ class ExampleUnitTest {
             emit(it * 2)
         }
     }
-
-    @Test
-    fun example2() {
-        runBlocking {
-            val buffer = ByteBuffer.allocate(100)
-
-            launch {
-                for (i in 1..10) {
-                    delay(100)
-                    buffer.put(i.toByte())
-                    println(i)
-                }
-            }
-
-            while (true) {
-                if (buffer.position() != buffer.limit()) {
-                    delay(30)
-                    continue
-                }
-                println("ok")
-            }
-        }
-    }
 }

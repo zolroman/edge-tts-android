@@ -45,6 +45,8 @@ class EdgeTTSService : TextToSpeechService() {
     private val synthesisMutex = Mutex()
     @Volatile
     private var activeSynthesis: SynthesisState? = null
+    private var pendingAudio: PendingAudio? = null
+    private var sequenceNumber = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -76,6 +78,7 @@ class EdgeTTSService : TextToSpeechService() {
     }
 
     override fun onStop() {
+        pendingAudio = null
         activeSynthesis?.stop()
     }
 
@@ -117,7 +120,7 @@ class EdgeTTSService : TextToSpeechService() {
 
         runBlocking {
             synthesisMutex.withLock {
-                val synthesis = SynthesisState()
+                val synthesis = SynthesisState(++sequenceNumber)
                 activeSynthesis = synthesis
                 try {
                     synthesizeToCallback(text, pitch, rate, callback, synthesis)
@@ -147,43 +150,94 @@ class EdgeTTSService : TextToSpeechService() {
         )
 
         coroutineScope {
-            val compressedAudio = Channel<Codec.Frame>(8)
-            val decoder = async(Dispatchers.IO) {
-                Codec(compressedAudio.consumeAsFlow(), applicationContext).run(coroutineContext).collect { frame ->
-                    if (!frame.endOfFrame && !synthesis.stopped) {
-                        sendAudio(callback, frame.data!!, synthesis)
-                    }
-                }
+            val audioToPlay = pendingAudio
+            pendingAudio = null
+            val currentAudio = async(Dispatchers.IO) {
+                synthesizeToPcm(text, metadata, synthesis)
             }
 
             try {
                 callback.start(sampleRate, AudioFormat.ENCODING_PCM_16BIT, 1)
-                engine.input(text, metadata)
 
-                while (true) {
-                    val frame = engine.receiveOutput()
-                    when {
-                        frame.textCompleted -> break
-                        frame.audioCompleted -> compressedAudio.send(Codec.Frame(null, endOfFrame = true))
-                        frame.data != null -> compressedAudio.send(Codec.Frame(frame.data))
-                    }
+                if (audioToPlay == null) {
+                    sendInitialSilence(callback, synthesis)
+                } else {
+                    info("play buffered audio seq=${audioToPlay.sequence}")
+                    sendAudio(callback, audioToPlay, synthesis)
                 }
 
-                compressedAudio.close()
-                decoder.await()
+                val preparedAudio = currentAudio.await()
+                if (!synthesis.stopped && preparedAudio.hasAudio) {
+                    pendingAudio = preparedAudio
+                    info("buffered synthesized audio seq=${preparedAudio.sequence}")
+                }
 
                 if (synthesis.stopped) {
+                    pendingAudio = null
                     callback.error()
                 } else {
                     callback.done()
                 }
             } catch (e: Throwable) {
-                compressedAudio.close(e)
-                decoder.cancel()
+                currentAudio.cancel()
+                pendingAudio = null
                 callback.error()
                 error("synthesize text error: $e")
             }
         }
+    }
+
+    private suspend fun synthesizeToPcm(
+        text: String,
+        metadata: TTS.AudioMetaData,
+        synthesis: SynthesisState
+    ): PendingAudio = coroutineScope {
+        val compressedAudio = Channel<Codec.Frame>(8)
+        val decoded = mutableListOf<ByteArray>()
+        val decoder = async(Dispatchers.IO) {
+            Codec(compressedAudio.consumeAsFlow(), applicationContext).run(coroutineContext).collect { frame ->
+                if (!frame.endOfFrame && !synthesis.stopped) {
+                    decoded.add(frame.data!!)
+                }
+            }
+        }
+
+        try {
+            engine.input(text, metadata)
+
+            while (true) {
+                val frame = engine.receiveOutput()
+                when {
+                    frame.textCompleted -> break
+                    frame.audioCompleted -> compressedAudio.send(Codec.Frame(null, endOfFrame = true))
+                    frame.data != null -> compressedAudio.send(Codec.Frame(frame.data))
+                }
+            }
+
+            compressedAudio.close()
+            decoder.await()
+            PendingAudio(synthesis.sequence, decoded)
+        } catch (e: Throwable) {
+            compressedAudio.close(e)
+            decoder.cancel()
+            throw e
+        }
+    }
+
+    private fun sendAudio(callback: SynthesisCallback, audio: PendingAudio, synthesis: SynthesisState) {
+        for (chunk in audio.chunks) {
+            sendAudio(callback, chunk, synthesis)
+            if (synthesis.stopped) {
+                return
+            }
+        }
+    }
+
+    private fun sendInitialSilence(callback: SynthesisCallback, synthesis: SynthesisState) {
+        val silenceDurationMs = 20
+        val bytesPerSample = 2
+        val size = sampleRate * silenceDurationMs / 1000 * bytesPerSample
+        sendAudio(callback, ByteArray(size), synthesis)
     }
 
     private fun sendAudio(callback: SynthesisCallback, data: ByteArray, synthesis: SynthesisState) {
@@ -200,7 +254,21 @@ class EdgeTTSService : TextToSpeechService() {
         }
     }
 
+    private class PendingAudio(
+        val sequence: Long,
+        val chunks: List<ByteArray>
+    ) {
+        val hasAudio: Boolean
+            get() = chunks.any { it.isNotEmpty() }
+    }
+
     private class SynthesisState {
+        constructor(sequence: Long) {
+            this.sequence = sequence
+        }
+
+        val sequence: Long
+
         @Volatile
         var stopped: Boolean = false
             private set
